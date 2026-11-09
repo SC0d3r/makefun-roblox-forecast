@@ -16,10 +16,18 @@ const SMOOTHING = 8;
 const MIN_PROBABILITY = 1e-4;
 const MAX_ROWS_PER_PLACE = 100;
 const PLACE_CAP = 0.95;
+// Riser mixture: games climbing the chart fast (14h rank velocity + player growth)
+// absorb most next-read top10 entries, so they get a slice of every place.
+const RISER_WINDOW_HOURS = 14;
+const RISER_K = 4;
+const RISER_W = 0.24;
+const RISER_PROFILE = [0.02, 0.03, 0.05, 0.07, 0.1, 0.13, 0.15, 0.15, 0.15, 0.15];
+const FLOOR_ALPHA = 0.02;
 
 interface TrendingRow {
   rank: number;
   universe_id: number;
+  playing?: number | null;
 }
 
 interface Read {
@@ -203,7 +211,7 @@ function averageKernels(
   const averages = createRankBuckets();
 
   for (let oldRank = 1; oldRank <= MAX_OLD_RANK; oldRank++) {
-    const totals = new Array<number>(PLACES + 1).fill(0);
+    const logTotals = new Array<number>(PLACES + 1).fill(0);
     for (let h = 1; h <= HORIZONS; h++) {
       const source = horizonTotals[h]! >= 40 ? counts[h]! : countsAll;
       const row = source[oldRank]!;
@@ -214,10 +222,12 @@ function averageKernels(
       for (let place = 1; place <= PLACES; place++) {
         const kernel =
           (row[place]! + SMOOTHING * priors[h]![oldRank]![place]!) / denominator;
-        totals[place]! += kernel;
+        logTotals[place]! += Math.log(Math.max(kernel, 1e-12));
       }
     }
-    for (let place = 1; place <= PLACES; place++) averages[oldRank]![place] = totals[place]! / HORIZONS;
+    for (let place = 1; place <= PLACES; place++) {
+      averages[oldRank]![place] = Math.exp(logTotals[place]! / HORIZONS);
+    }
   }
 
   return averages;
@@ -243,8 +253,126 @@ function scoreLastReadGames(last: KernelRead, kernelAverages: number[][]): Map<n
   return games;
 }
 
-function capPlaces(games: Map<number, GameForecast>): void {
+function linearSlope(points: Array<[number, number]>): number | null {
+  if (points.length < 2) return null;
+  let sumX = 0;
+  let sumY = 0;
+  for (const [x, y] of points) {
+    sumX += x;
+    sumY += y;
+  }
+  const meanX = sumX / points.length;
+  const meanY = sumY / points.length;
+  let denominator = 0;
+  let numerator = 0;
+  for (const [x, y] of points) {
+    denominator += (x - meanX) ** 2;
+    numerator += (x - meanX) * (y - meanY);
+  }
+  if (denominator <= 1e-6) return null;
+  return numerator / denominator;
+}
+
+// Riser score: how fast a game is climbing (negative rank slope) plus how fast its
+// player count is growing, each standardised across the last read's chart.
+function computeRisers(reads: KernelRead[]): Map<number, number> {
+  const scores = new Map<number, number>();
+  const last = reads[reads.length - 1];
+  if (last === undefined) return scores;
+
+  const windowReads = reads.filter((read) => last.atMs - read.atMs <= RISER_WINDOW_HOURS * 3_600_000);
+  const velocities = new Map<number, number | null>();
+  const growths = new Map<number, number | null>();
+
+  for (const row of last.top_trending) {
+    const rankPoints: Array<[number, number]> = [];
+    const growthPoints: Array<[number, number]> = [];
+    for (const read of windowReads) {
+      const seen = read.byUniverse.get(row.universe_id);
+      if (seen === undefined) continue;
+      const x = (read.atMs - last.atMs) / 3_600_000;
+      rankPoints.push([x, seen.rank]);
+      if (typeof seen.playing === 'number' && seen.playing > 0) {
+        growthPoints.push([x, Math.log(seen.playing)]);
+      }
+    }
+    velocities.set(row.universe_id, linearSlope(rankPoints));
+    growths.set(row.universe_id, linearSlope(growthPoints));
+  }
+
+  const velocityValues = [...velocities.values()].filter((value): value is number => value !== null);
+  const growthValues = [...growths.values()].filter((value): value is number => value !== null);
+  const mean = (values: number[]): number =>
+    values.length === 0 ? 0 : values.reduce((total, value) => total + value, 0) / values.length;
+  const deviation = (values: number[]): number => {
+    if (values.length < 2) return 1;
+    const centre = mean(values);
+    return Math.max(Math.sqrt(values.reduce((total, value) => total + (value - centre) ** 2, 0) / values.length), 1e-9);
+  };
+  const velocityMean = mean(velocityValues);
+  const velocityDeviation = deviation(velocityValues);
+  const growthMean = mean(growthValues);
+  const growthDeviation = deviation(growthValues);
+
+  for (const universeId of velocities.keys()) {
+    let score = 0;
+    const velocity = velocities.get(universeId);
+    const growth = growths.get(universeId);
+    if (velocity !== null && velocity !== undefined) score += -(velocity - velocityMean) / velocityDeviation;
+    if (growth !== null && growth !== undefined) score += (growth - growthMean) / growthDeviation;
+    scores.set(universeId, score);
+  }
+
+  return scores;
+}
+
+function applyRiserMixture(games: Map<number, GameForecast>, reads: KernelRead[]): void {
+  const scores = computeRisers(reads);
+  const chosen = [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, RISER_K);
+  if (chosen.length === 0) return;
+
+  for (const [universeId] of chosen) {
+    if (!games.has(universeId)) {
+      games.set(universeId, { rank: 0, places: new Array<number>(BUCKETS).fill(0) });
+    }
+  }
+
+  const profileTotal = RISER_PROFILE.reduce((total, value) => total + value, 0);
+  const share = RISER_W / chosen.length;
   for (let place = 1; place <= PLACES; place++) {
+    let total = 0;
+    for (const game of games.values()) total += game.places[place]!;
+    if (total <= 0) continue;
+    for (const game of games.values()) {
+      game.places[place] = ((1 - RISER_W) * game.places[place]!) / total;
+    }
+    for (const [universeId] of chosen) {
+      const game = games.get(universeId)!;
+      game.places[place]! += (share * RISER_PROFILE[place - 1]!) / profileTotal;
+    }
+  }
+}
+
+// Uniform floor over every game in the last chart, then renormalise each place.
+function applyFloor(games: Map<number, GameForecast>, last: KernelRead): void {
+  for (const row of last.top_trending) {
+    if (!games.has(row.universe_id)) {
+      games.set(row.universe_id, { rank: 0, places: new Array<number>(BUCKETS).fill(0) });
+    }
+  }
+  const count = games.size;
+  if (count === 0) return;
+  for (let place = 1; place <= PLACES; place++) {
+    let total = 0;
+    for (const game of games.values()) total += game.places[place]!;
+    for (const game of games.values()) {
+      const base = total > 0 ? game.places[place]! / total : 0;
+      game.places[place] = (1 - FLOOR_ALPHA) * base + FLOOR_ALPHA / count;
+    }
+  }
+}
+
+function capPlaces(games: Map<number, GameForecast>): void {  for (let place = 1; place <= PLACES; place++) {
     let total = 0;
     for (const game of games.values()) total += game.places[place]!;
     if (total <= PLACE_CAP) continue;
@@ -329,6 +457,8 @@ function main(): void {
     const kernelAverages = averageKernels(counts, countsAll, horizonTotals, priors);
     const games = scoreLastReadGames(kernelReads[kernelReads.length - 1]!, kernelAverages);
 
+    applyRiserMixture(games, kernelReads);
+    applyFloor(games, kernelReads[kernelReads.length - 1]!);
     capPlaces(games);
     probabilities = collectProbabilities(games);
     top10 = chooseTop10(games, probabilities);
