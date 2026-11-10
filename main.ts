@@ -24,6 +24,14 @@ const RISER_W = 0.24;
 const RISER_PROFILE = [0.02, 0.03, 0.05, 0.07, 0.1, 0.13, 0.15, 0.15, 0.15, 0.15];
 const FLOOR_ALPHA = 0.02;
 
+// With the house recorder's hourly reads, every one of the 24 scored slots has its own
+// horizon kernel. One static forecast is scored against all of them, so the optimal
+// static probability is the arithmetic mean of the per-slot marginals (a mixture); a
+// geometric pool is sharper than that and loses log score. Keep the geometric pool
+// when the history has no hourly pairs and the per-horizon counts are sparse.
+const HOURLY_PAIRS_MIN = 40;
+
+
 interface TrendingRow {
   rank: number;
   universe_id: number;
@@ -209,9 +217,10 @@ function averageKernels(
   priors: number[][][],
 ): number[][] {
   const averages = createRankBuckets();
+  const arithmetic = horizonTotals[1]! >= HOURLY_PAIRS_MIN;
 
   for (let oldRank = 1; oldRank <= MAX_OLD_RANK; oldRank++) {
-    const logTotals = new Array<number>(PLACES + 1).fill(0);
+    const totals = new Array<number>(PLACES + 1).fill(0);
     for (let h = 1; h <= HORIZONS; h++) {
       const source = horizonTotals[h]! >= 40 ? counts[h]! : countsAll;
       const row = source[oldRank]!;
@@ -222,11 +231,17 @@ function averageKernels(
       for (let place = 1; place <= PLACES; place++) {
         const kernel =
           (row[place]! + SMOOTHING * priors[h]![oldRank]![place]!) / denominator;
-        logTotals[place]! += Math.log(Math.max(kernel, 1e-12));
+        if (arithmetic) {
+          totals[place]! += kernel;
+        } else {
+          totals[place]! += Math.log(Math.max(kernel, 1e-12));
+        }
       }
     }
     for (let place = 1; place <= PLACES; place++) {
-      averages[oldRank]![place] = Math.exp(logTotals[place]! / HORIZONS);
+      averages[oldRank]![place] = arithmetic
+        ? totals[place]! / HORIZONS
+        : Math.exp(totals[place]! / HORIZONS);
     }
   }
 
